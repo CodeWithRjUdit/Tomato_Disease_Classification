@@ -27,13 +27,17 @@ streamlit run tomato_app.py
 5. In Advanced settings, select Python 3.11.
 6. Deploy.
 
-The trained model file, `tomato_model.keras`, must remain in the repository root.
+The exported TensorFlow SavedModel under `model/1/` (including its
+`variables/` checkpoint files) must remain in the repository. The
+`tomato_model.keras` archive is retained as a fallback.
 
 ## Model input and preprocessing
 
-The app reads the model's expected image dimensions from its input shape,
-converts uploaded images to RGB, resizes them, and scales pixel values to
-the range [0, 1], matching the preprocessing used in the original app.
+The app reads the model's expected image dimensions from its input signature,
+converts uploaded images to RGB, resizes them, and sends float32 pixel values
+in the 0–255 range. The training notebook embeds a Keras Rescaling(1./255)
+layer inside the model, so the app must not divide uploaded pixels by 255
+before inference. Doing so would normalize the image twice.
 
 ## Important note
 

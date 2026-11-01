@@ -137,18 +137,13 @@ def load_model():
         except Exception as error:
             errors.append(f"Keras archive ({keras_model_path.name}): {error}")
 
-    details = "
-
-".join(errors) if errors else (
+    details = "\n\n".join(errors) if errors else (
         "Neither model/1/saved_model.pb nor tomato_model.keras was found."
     )
     raise RuntimeError(
         "No compatible tomato model could be loaded. "
         "The app will not make predictions using missing or uninitialized weights. "
-        f"
-
-Details:
-{details}"
+        f"\n\nDetails:\n{details}"
     )
 
 

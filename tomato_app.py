@@ -226,28 +226,31 @@ def convert_scores_to_probabilities(scores):
 
 
 def predict_disease(model_info, uploaded_image):
-    """Predict a class and return raw diagnostics for input-sensitivity checks."""
+    """Predict using raw RGB pixel values, as expected by the trained model."""
     target_size = get_model_image_size(model_info)
-    image = uploaded_image.convert("RGB").resize(
-        target_size, Image.Resampling.BILINEAR
-    )
 
-    image_array_0_255 = np.asarray(image, dtype=np.float32)
-    image_batch_0_1 = np.expand_dims(image_array_0_255 / 255.0, axis=0)
+    image = uploaded_image.convert("RGB")
+    image = image.resize(target_size, Image.Resampling.BILINEAR)
 
-    raw_scores = run_raw_inference(model_info, image_batch_0_1)
+    # IMPORTANT:
+    # The original training notebook embeds layers.Rescaling(1./255)
+    # inside the model. Therefore, pass uint8-scale pixel values (0..255)
+    # as float32 and DO NOT divide by 255 here.
+    image_array_0_to_255 = np.asarray(image, dtype=np.float32)
+    image_batch_0_to_255 = np.expand_dims(image_array_0_to_255, axis=0)
+
+    raw_scores = run_raw_inference(model_info, image_batch_0_to_255)
     probabilities, score_interpretation = convert_scores_to_probabilities(raw_scores)
-
     predicted_index = int(np.argmax(probabilities))
 
-    # Diagnostic probes: these are not training samples. They test whether
-    # the exported model reacts to meaningfully different input tensors.
+    # Diagnostic probes use the same 0..255 scale as the training pipeline.
     probe_results = {}
     probes = {
-        "all_black_0_to_1": np.zeros_like(image_batch_0_1),
-        "mid_gray_0_to_1": np.full_like(image_batch_0_1, 0.5),
-        "all_white_0_to_1": np.ones_like(image_batch_0_1),
-        "uploaded_image_0_to_255": np.expand_dims(image_array_0_255, axis=0),
+        "all_black_0_to_255": np.zeros_like(image_batch_0_to_255),
+        "mid_gray_0_to_255": np.full_like(image_batch_0_to_255, 127.5),
+        "all_white_0_to_255": np.full_like(image_batch_0_to_255, 255.0),
+        # Control: this is intentionally the incorrect, externally normalized input.
+        "uploaded_image_0_to_1_control": image_batch_0_to_255 / 255.0,
     }
 
     for probe_name, probe_batch in probes.items():
@@ -258,7 +261,7 @@ def predict_disease(model_info, uploaded_image):
             "top_score_percent": round(
                 float(np.max(probe_probabilities)) * 100.0, 6
             ),
-            "max_abs_raw_score_delta_vs_uploaded_0_to_1": round(
+            "max_abs_raw_score_delta_vs_uploaded_0_to_255": round(
                 float(np.max(np.abs(probe_scores - raw_scores))), 10
             ),
             "raw_scores": np.round(probe_scores, 8).tolist(),
@@ -272,10 +275,19 @@ def predict_disease(model_info, uploaded_image):
             if model_info["kind"] == "saved_model"
             else "float32"
         ),
-        "uploaded_input_min_0_to_1": round(float(np.min(image_batch_0_1)), 6),
-        "uploaded_input_max_0_to_1": round(float(np.max(image_batch_0_1)), 6),
-        "uploaded_input_mean_0_to_1": round(float(np.mean(image_batch_0_1)), 6),
-        "uploaded_input_std_0_to_1": round(float(np.std(image_batch_0_1)), 6),
+        "input_scale_sent_to_model": "0_to_255 (model contains Rescaling(1./255))",
+        "uploaded_input_min_0_to_255": round(
+            float(np.min(image_batch_0_to_255)), 6
+        ),
+        "uploaded_input_max_0_to_255": round(
+            float(np.max(image_batch_0_to_255)), 6
+        ),
+        "uploaded_input_mean_0_to_255": round(
+            float(np.mean(image_batch_0_to_255)), 6
+        ),
+        "uploaded_input_std_0_to_255": round(
+            float(np.std(image_batch_0_to_255)), 6
+        ),
         "raw_model_scores": np.round(raw_scores, 8).tolist(),
         "probability_interpretation": score_interpretation,
         "probes": probe_results,
@@ -350,10 +362,11 @@ if uploaded_file is not None:
                     "model_kind": diagnostics["model_kind"],
                     "input_shape": diagnostics["input_shape"],
                     "input_dtype": diagnostics["input_dtype"],
-                    "uploaded_input_min_0_to_1": diagnostics["uploaded_input_min_0_to_1"],
-                    "uploaded_input_max_0_to_1": diagnostics["uploaded_input_max_0_to_1"],
-                    "uploaded_input_mean_0_to_1": diagnostics["uploaded_input_mean_0_to_1"],
-                    "uploaded_input_std_0_to_1": diagnostics["uploaded_input_std_0_to_1"],
+                    "input_scale_sent_to_model": diagnostics["input_scale_sent_to_model"],
+                    "uploaded_input_min_0_to_255": diagnostics["uploaded_input_min_0_to_255"],
+                    "uploaded_input_max_0_to_255": diagnostics["uploaded_input_max_0_to_255"],
+                    "uploaded_input_mean_0_to_255": diagnostics["uploaded_input_mean_0_to_255"],
+                    "uploaded_input_std_0_to_255": diagnostics["uploaded_input_std_0_to_255"],
                     "probability_interpretation": diagnostics["probability_interpretation"],
                 })
                 st.write("**Raw model scores for the uploaded image**")
@@ -365,10 +378,9 @@ if uploaded_file is not None:
                 })
                 st.write("**Input-sensitivity probes**")
                 st.caption(
-                    "Each probe is compared with the uploaded image after normalizing "
-                    "the uploaded image to 0–1. A zero or near-zero score difference "
-                    "across black, gray, white and the original image is a warning "
-                    "that the exported model may not be using its image input properly."
+                    "The original training notebook places Rescaling(1./255) inside the model, "
+                    "so the uploaded image is now sent in the 0–255 range. The final "
+                    "0–1 control is intentionally incorrect and should behave differently."
                 )
                 st.json(diagnostics["probes"])
 

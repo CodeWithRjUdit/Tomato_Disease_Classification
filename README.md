@@ -10,7 +10,7 @@ Use Python 3.11:
 ```bash
 python -m venv .venv
 # Windows:
-.venv\\Scripts\\activate
+.venv\Scripts\activate
 # macOS / Linux:
 source .venv/bin/activate
 

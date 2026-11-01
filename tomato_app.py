@@ -169,16 +169,8 @@ def get_model_image_size(model_info):
     return (width, height)
 
 
-def predict_disease(model_info, uploaded_image):
-    """Preprocess an image and run either Keras or SavedModel inference."""
-    target_size = get_model_image_size(model_info)
-
-    image = uploaded_image.convert("RGB")
-    image = image.resize(target_size, Image.Resampling.BILINEAR)
-
-    image_array = np.asarray(image, dtype=np.float32) / 255.0
-    image_batch = np.expand_dims(image_array, axis=0)
-
+def run_raw_inference(model_info, image_batch):
+    """Run a batch through the selected model and return its raw output vector."""
     if model_info["kind"] == "saved_model":
         input_tensor = tf.convert_to_tensor(
             image_batch, dtype=model_info["input_dtype"]
@@ -193,7 +185,7 @@ def predict_disease(model_info, uploaded_image):
         output_name = model_info["output_name"]
         raw_scores = outputs[output_name] if output_name is not None else outputs
     else:
-        raw_scores = model_info["model"].predict(image_batch, verbose=0)
+        raw_scores = model_info["model"](image_batch, training=False)
 
     if isinstance(raw_scores, (list, tuple)):
         if len(raw_scores) != 1:
@@ -209,27 +201,87 @@ def predict_disease(model_info, uploaded_image):
         raise ValueError(f"Unexpected model output shape: {scores.shape}.")
 
     scores = scores[0]
-
     if len(scores) != len(TOMATO_CLASSES):
         raise ValueError(
             f"The model returned {len(scores)} scores, but the app has "
             f"{len(TOMATO_CLASSES)} dataset labels."
         )
-
     if not np.all(np.isfinite(scores)):
         raise ValueError("The model returned invalid prediction scores.")
 
-    if (
+    return scores
+
+
+def convert_scores_to_probabilities(scores):
+    """Convert a score vector to a display distribution without hiding raw scores."""
+    is_probability_vector = (
         np.all(scores >= 0.0)
         and np.all(scores <= 1.0)
         and np.isclose(np.sum(scores), 1.0, atol=0.05)
-    ):
-        probabilities = scores
-    else:
-        probabilities = tf.nn.softmax(scores).numpy()
+    )
+
+    if is_probability_vector:
+        return scores, "Model output already sums to approximately 1"
+    return tf.nn.softmax(scores).numpy(), "Softmax applied to raw model scores"
+
+
+def predict_disease(model_info, uploaded_image):
+    """Predict a class and return raw diagnostics for input-sensitivity checks."""
+    target_size = get_model_image_size(model_info)
+    image = uploaded_image.convert("RGB").resize(
+        target_size, Image.Resampling.BILINEAR
+    )
+
+    image_array_0_255 = np.asarray(image, dtype=np.float32)
+    image_batch_0_1 = np.expand_dims(image_array_0_255 / 255.0, axis=0)
+
+    raw_scores = run_raw_inference(model_info, image_batch_0_1)
+    probabilities, score_interpretation = convert_scores_to_probabilities(raw_scores)
 
     predicted_index = int(np.argmax(probabilities))
-    return predicted_index, probabilities
+
+    # Diagnostic probes: these are not training samples. They test whether
+    # the exported model reacts to meaningfully different input tensors.
+    probe_results = {}
+    probes = {
+        "all_black_0_to_1": np.zeros_like(image_batch_0_1),
+        "mid_gray_0_to_1": np.full_like(image_batch_0_1, 0.5),
+        "all_white_0_to_1": np.ones_like(image_batch_0_1),
+        "uploaded_image_0_to_255": np.expand_dims(image_array_0_255, axis=0),
+    }
+
+    for probe_name, probe_batch in probes.items():
+        probe_scores = run_raw_inference(model_info, probe_batch)
+        probe_probabilities, _ = convert_scores_to_probabilities(probe_scores)
+        probe_results[probe_name] = {
+            "predicted_class": TOMATO_CLASSES[int(np.argmax(probe_probabilities))],
+            "top_score_percent": round(
+                float(np.max(probe_probabilities)) * 100.0, 6
+            ),
+            "max_abs_raw_score_delta_vs_uploaded_0_to_1": round(
+                float(np.max(np.abs(probe_scores - raw_scores))), 10
+            ),
+            "raw_scores": np.round(probe_scores, 8).tolist(),
+        }
+
+    diagnostics = {
+        "model_kind": model_info["kind"],
+        "input_shape": list(model_info["input_shape"]),
+        "input_dtype": (
+            str(model_info["input_dtype"])
+            if model_info["kind"] == "saved_model"
+            else "float32"
+        ),
+        "uploaded_input_min_0_to_1": round(float(np.min(image_batch_0_1)), 6),
+        "uploaded_input_max_0_to_1": round(float(np.max(image_batch_0_1)), 6),
+        "uploaded_input_mean_0_to_1": round(float(np.mean(image_batch_0_1)), 6),
+        "uploaded_input_std_0_to_1": round(float(np.std(image_batch_0_1)), 6),
+        "raw_model_scores": np.round(raw_scores, 8).tolist(),
+        "probability_interpretation": score_interpretation,
+        "probes": probe_results,
+    }
+
+    return predicted_index, probabilities, diagnostics
 
 
 # ---------------------------------------------------------------------
@@ -263,14 +315,25 @@ if uploaded_file is not None:
         if st.button("Classify image", type="primary", use_container_width=True):
             with st.spinner("Analysing the image..."):
                 model = load_model()
-                predicted_index, probabilities = predict_disease(model, image)
+                predicted_index, probabilities, diagnostics = predict_disease(model, image)
 
             predicted_class = TOMATO_CLASSES[predicted_index]
-            confidence = float(probabilities[predicted_index]) * 100.0
+            model_score = float(probabilities[predicted_index]) * 100.0
 
             st.subheader("Prediction")
             st.success(predicted_class)
-            st.metric("Model confidence", f"{confidence:.2f}%")
+            st.metric("Model score (not calibrated confidence)", f"{model_score:.2f}%")
+            st.caption(
+                "This percentage is the model's output score after normalization; "
+                "it is not a verified probability of diagnostic correctness."
+            )
+
+            if model_score >= 99.9:
+                st.warning(
+                    "The model output is extremely concentrated on one class. "
+                    "Do not rely on this result until the diagnostic checks below "
+                    "and independent test images have been reviewed."
+                )
 
             st.subheader("Top predictions")
             top_indices = np.argsort(probabilities)[::-1][:3]
@@ -280,6 +343,34 @@ if uploaded_file is not None:
                 score = float(probabilities[index]) * 100.0
                 st.write(f"**{label}** — {score:.2f}%")
                 st.progress(min(max(float(probabilities[index]), 0.0), 1.0))
+
+            with st.expander("Model diagnostics (for troubleshooting)"):
+                st.write("**Input and model details**")
+                st.json({
+                    "model_kind": diagnostics["model_kind"],
+                    "input_shape": diagnostics["input_shape"],
+                    "input_dtype": diagnostics["input_dtype"],
+                    "uploaded_input_min_0_to_1": diagnostics["uploaded_input_min_0_to_1"],
+                    "uploaded_input_max_0_to_1": diagnostics["uploaded_input_max_0_to_1"],
+                    "uploaded_input_mean_0_to_1": diagnostics["uploaded_input_mean_0_to_1"],
+                    "uploaded_input_std_0_to_1": diagnostics["uploaded_input_std_0_to_1"],
+                    "probability_interpretation": diagnostics["probability_interpretation"],
+                })
+                st.write("**Raw model scores for the uploaded image**")
+                st.json({
+                    label: float(score)
+                    for label, score in zip(
+                        TOMATO_CLASSES, diagnostics["raw_model_scores"]
+                    )
+                })
+                st.write("**Input-sensitivity probes**")
+                st.caption(
+                    "Each probe is compared with the uploaded image after normalizing "
+                    "the uploaded image to 0–1. A zero or near-zero score difference "
+                    "across black, gray, white and the original image is a warning "
+                    "that the exported model may not be using its image input properly."
+                )
+                st.json(diagnostics["probes"])
 
     except Exception as error:
         st.error("The image could not be processed.")

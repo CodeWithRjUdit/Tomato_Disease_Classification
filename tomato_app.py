@@ -33,17 +33,68 @@ TOMATO_CLASSES = [
 
 @st.cache_resource(show_spinner="Loading the tomato disease model...")
 def load_model():
-    """Load the trained Keras model once and reuse it across sessions."""
-    if not MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Model file not found: {MODEL_PATH.name}. "
-            "Make sure tomato_model.keras is present in the repository root."
-        )
+    """Load a complete inference model and verify its class-output dimension."""
+    saved_model_dir = Path(__file__).resolve().parent / "model" / "1"
+    keras_model_path = Path(__file__).resolve().parent / "tomato_model.keras"
 
-    # compile=False is appropriate for inference and avoids loading
-    # training-only optimizer/loss configuration.
-    return tf.keras.models.load_model(MODEL_PATH, compile=False)
+    errors = []
 
+    # The repository also contains a TensorFlow SavedModel export. Prefer it
+    # because the .keras archive has been failing to restore Conv2D weights.
+    if (saved_model_dir / "saved_model.pb").is_file():
+        try:
+            model = tf.keras.models.load_model(saved_model_dir, compile=False)
+            output_shape = model.output_shape
+
+            if isinstance(output_shape, list):
+                if len(output_shape) != 1:
+                    raise ValueError(
+                        "The SavedModel has multiple outputs; one output is expected."
+                    )
+                output_shape = output_shape[0]
+
+            if output_shape[-1] != len(TOMATO_CLASSES):
+                raise ValueError(
+                    f"SavedModel outputs {output_shape[-1]} classes, but the app "
+                    f"defines {len(TOMATO_CLASSES)} tomato classes."
+                )
+
+            return model
+        except Exception as error:
+            errors.append(f"SavedModel ({saved_model_dir}): {error}")
+
+    # Keep the .keras archive as a fallback, but do not use it unless its
+    # variables load successfully and its output dimension matches the labels.
+    if keras_model_path.is_file():
+        try:
+            model = tf.keras.models.load_model(keras_model_path, compile=False)
+            output_shape = model.output_shape
+
+            if isinstance(output_shape, list):
+                if len(output_shape) != 1:
+                    raise ValueError(
+                        "The .keras model has multiple outputs; one output is expected."
+                    )
+                output_shape = output_shape[0]
+
+            if output_shape[-1] != len(TOMATO_CLASSES):
+                raise ValueError(
+                    f".keras model outputs {output_shape[-1]} classes, but the app "
+                    f"defines {len(TOMATO_CLASSES)} tomato classes."
+                )
+
+            return model
+        except Exception as error:
+            errors.append(f"Keras archive ({keras_model_path.name}): {error}")
+
+    detail = "\\n\\n".join(errors) if errors else (
+        "Neither model/1/saved_model.pb nor tomato_model.keras was found."
+    )
+    raise RuntimeError(
+        "No compatible tomato model could be loaded. "
+        "The app will not make predictions using missing or uninitialized weights. "
+        f"\\n\\nDetails:\\n{detail}"
+    )
 
 def get_model_image_size(model):
     """Read the model's expected image dimensions instead of hard-coding them."""

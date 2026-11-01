@@ -148,7 +148,7 @@ if uploaded_file is not None:
         st.image(
             image,
             caption="Uploaded tomato leaf",
-            use_container_width=True,
+            use_column_width=True,
         )
 
         if st.button("Classify image", type="primary", use_container_width=True):

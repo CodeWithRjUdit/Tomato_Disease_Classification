@@ -24,86 +24,137 @@ TOMATO_CLASSES = [
     "Tomato - Leaf Mold",
     "Tomato - Septoria Leaf Spot",
     "Tomato - Spider Mites",
-    "Tomato - Target Spot",
     "Tomato - Yellow Leaf Curl Virus",
     "Tomato - Mosaic Virus",
     "Tomato - Healthy",
 ]
 
-
 @st.cache_resource(show_spinner="Loading the tomato disease model...")
 def load_model():
-    """Load a complete inference model and verify its class-output dimension."""
+    """Load the exported SavedModel signature, with a validated Keras fallback."""
     saved_model_dir = Path(__file__).resolve().parent / "model" / "1"
     keras_model_path = Path(__file__).resolve().parent / "tomato_model.keras"
-
     errors = []
 
-    # The repository also contains a TensorFlow SavedModel export. Prefer it
-    # because the .keras archive has been failing to restore Conv2D weights.
+    # Prefer the TensorFlow SavedModel export. tf.saved_model.load returns a
+    # Trackable object, so inference must use its concrete serving signature.
     if (saved_model_dir / "saved_model.pb").is_file():
         try:
-            model = tf.keras.models.load_model(saved_model_dir, compile=False)
-            output_shape = model.output_shape
+            loaded = tf.saved_model.load(str(saved_model_dir))
+            signatures = loaded.signatures
 
-            if isinstance(output_shape, list):
-                if len(output_shape) != 1:
-                    raise ValueError(
-                        "The SavedModel has multiple outputs; one output is expected."
-                    )
-                output_shape = output_shape[0]
+            if not signatures:
+                raise ValueError("SavedModel contains no callable signatures.")
 
-            if output_shape[-1] != len(TOMATO_CLASSES):
+            if "serving_default" in signatures:
+                serving_fn = signatures["serving_default"]
+            elif len(signatures) == 1:
+                serving_fn = next(iter(signatures.values()))
+            else:
                 raise ValueError(
-                    f"SavedModel outputs {output_shape[-1]} classes, but the app "
-                    f"defines {len(TOMATO_CLASSES)} tomato classes."
+                    "SavedModel has no serving_default signature and exposes "
+                    f"multiple signatures: {list(signatures.keys())}"
                 )
 
-            return model
+            positional_specs, keyword_specs = serving_fn.structured_input_signature
+
+            if keyword_specs and not positional_specs and len(keyword_specs) == 1:
+                input_style = "keyword"
+                input_name, input_spec = next(iter(keyword_specs.items()))
+            elif len(positional_specs) == 1 and not keyword_specs:
+                input_style = "positional"
+                input_name = None
+                input_spec = positional_specs[0]
+            else:
+                raise ValueError(
+                    "Expected exactly one image input in the SavedModel signature. "
+                    f"Received positional={positional_specs}, keyword={keyword_specs}."
+                )
+
+            output_specs = serving_fn.structured_outputs
+            if isinstance(output_specs, dict):
+                if len(output_specs) != 1:
+                    raise ValueError(
+                        "Expected exactly one prediction output. "
+                        f"Received outputs: {list(output_specs.keys())}."
+                    )
+                output_name, output_spec = next(iter(output_specs.items()))
+            else:
+                output_name = None
+                output_spec = output_specs
+
+            input_shape = tuple(input_spec.shape)
+            output_shape = tuple(output_spec.shape)
+
+            if len(input_shape) != 4:
+                raise ValueError(
+                    f"Expected image input shape [batch, height, width, channels]; "
+                    f"received {input_shape}."
+                )
+            if len(output_shape) != 2 or output_shape[-1] != len(TOMATO_CLASSES):
+                raise ValueError(
+                    f"SavedModel output shape is {output_shape}; expected "
+                    f"[batch, {len(TOMATO_CLASSES)}] for the dataset's "
+                    f"{len(TOMATO_CLASSES)} classes."
+                )
+
+            return {
+                "kind": "saved_model",
+                "signature": serving_fn,
+                "input_style": input_style,
+                "input_name": input_name,
+                "input_shape": input_shape,
+                "input_dtype": input_spec.dtype,
+                "output_name": output_name,
+            }
         except Exception as error:
             errors.append(f"SavedModel ({saved_model_dir}): {error}")
 
-    # Keep the .keras archive as a fallback, but do not use it unless its
-    # variables load successfully and its output dimension matches the labels.
+    # Fallback only if the .keras archive genuinely restores all its weights.
     if keras_model_path.is_file():
         try:
-            model = tf.keras.models.load_model(keras_model_path, compile=False)
-            output_shape = model.output_shape
+            keras_model = tf.keras.models.load_model(
+                keras_model_path, compile=False
+            )
+            output_shape = keras_model.output_shape
 
             if isinstance(output_shape, list):
                 if len(output_shape) != 1:
-                    raise ValueError(
-                        "The .keras model has multiple outputs; one output is expected."
-                    )
+                    raise ValueError("Keras model has multiple outputs.")
                 output_shape = output_shape[0]
 
             if output_shape[-1] != len(TOMATO_CLASSES):
                 raise ValueError(
-                    f".keras model outputs {output_shape[-1]} classes, but the app "
-                    f"defines {len(TOMATO_CLASSES)} tomato classes."
+                    f"Keras model outputs {output_shape[-1]} classes, but "
+                    f"{len(TOMATO_CLASSES)} dataset classes are configured."
                 )
 
-            return model
+            return {
+                "kind": "keras",
+                "model": keras_model,
+                "input_shape": tuple(keras_model.input_shape),
+            }
         except Exception as error:
             errors.append(f"Keras archive ({keras_model_path.name}): {error}")
 
-    detail = "\\n\\n".join(errors) if errors else (
+    details = "
+
+".join(errors) if errors else (
         "Neither model/1/saved_model.pb nor tomato_model.keras was found."
     )
     raise RuntimeError(
         "No compatible tomato model could be loaded. "
         "The app will not make predictions using missing or uninitialized weights. "
-        f"\\n\\nDetails:\\n{detail}"
+        f"
+
+Details:
+{details}"
     )
 
-def get_model_image_size(model):
-    """Read the model's expected image dimensions instead of hard-coding them."""
-    input_shape = model.input_shape
 
-    if isinstance(input_shape, list):
-        if len(input_shape) != 1:
-            raise ValueError("This app expects a model with exactly one image input.")
-        input_shape = input_shape[0]
+def get_model_image_size(model_info):
+    """Read the model's expected image dimensions."""
+    input_shape = model_info["input_shape"]
 
     if len(input_shape) != 4:
         raise ValueError(
@@ -118,16 +169,14 @@ def get_model_image_size(model):
             f"The model expects {channels} channels. This app prepares RGB images."
         )
 
-    # Keep a fallback for models with dynamic spatial dimensions.
     height = int(height) if height is not None else 256
     width = int(width) if width is not None else 256
-
     return (width, height)
 
 
-def predict_disease(model, uploaded_image):
-    """Preprocess an image and return its predicted tomato class and scores."""
-    target_size = get_model_image_size(model)
+def predict_disease(model_info, uploaded_image):
+    """Preprocess an image and run either Keras or SavedModel inference."""
+    target_size = get_model_image_size(model_info)
 
     image = uploaded_image.convert("RGB")
     image = image.resize(target_size, Image.Resampling.BILINEAR)
@@ -135,12 +184,29 @@ def predict_disease(model, uploaded_image):
     image_array = np.asarray(image, dtype=np.float32) / 255.0
     image_batch = np.expand_dims(image_array, axis=0)
 
-    raw_scores = model.predict(image_batch, verbose=0)
+    if model_info["kind"] == "saved_model":
+        input_tensor = tf.convert_to_tensor(
+            image_batch, dtype=model_info["input_dtype"]
+        )
+        serving_fn = model_info["signature"]
+
+        if model_info["input_style"] == "keyword":
+            outputs = serving_fn(**{model_info["input_name"]: input_tensor})
+        else:
+            outputs = serving_fn(input_tensor)
+
+        output_name = model_info["output_name"]
+        raw_scores = outputs[output_name] if output_name is not None else outputs
+    else:
+        raw_scores = model_info["model"].predict(image_batch, verbose=0)
 
     if isinstance(raw_scores, (list, tuple)):
         if len(raw_scores) != 1:
             raise ValueError("The model returned multiple outputs; one is expected.")
         raw_scores = raw_scores[0]
+
+    if hasattr(raw_scores, "numpy"):
+        raw_scores = raw_scores.numpy()
 
     scores = np.asarray(raw_scores, dtype=np.float64)
 
@@ -152,15 +218,12 @@ def predict_disease(model, uploaded_image):
     if len(scores) != len(TOMATO_CLASSES):
         raise ValueError(
             f"The model returned {len(scores)} scores, but the app has "
-            f"{len(TOMATO_CLASSES)} class labels. The label list must match "
-            "the model's training class order."
+            f"{len(TOMATO_CLASSES)} dataset labels."
         )
 
     if not np.all(np.isfinite(scores)):
         raise ValueError("The model returned invalid prediction scores.")
 
-    # Use the model's probabilities directly when they are already normalized.
-    # Otherwise, interpret the returned values as logits.
     if (
         np.all(scores >= 0.0)
         and np.all(scores <= 1.0)
